@@ -1,19 +1,22 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import Response, StreamingResponse
 from typing import List
 import asyncio
 from datetime import datetime
+import io
 
 from .task_manager import task_manager
 from .background_processor import background_processor
 from .processors.async_white_processor import AsyncWhiteProcessor
 from .processors.async_interior_processor import AsyncInteriorProcessor
 from .models.schemas import ProcessingResponse, ImageResponse, TaskStatusResponse, TaskStatus
+from .auth import auth_manager, verify_api_key, verify_admin
+from .models.auth_schemas import UserCreate, UserResponse, APIKeyResponse, UserUpdate
 
 app = FastAPI(
-    title="Async Image Processing API",
-    description="Асинхронное API для обработки изображений с системой задач",
-    version="2.0.0"
+    title="Image Processing API",
+    description="API для обработки изображений с аутентификацией",
+    version="2.3.0"
 )
 
 @app.on_event("startup")
@@ -27,23 +30,47 @@ async def periodic_cleanup():
         await asyncio.sleep(3600)  # Каждый час
         task_manager.cleanup_old_tasks()
 
-@app.get("/")
-async def root():
-    return {"message": "Image Processing API", "version": "2.0.0"}
+# ==================== PUBLIC ENDPOINTS ====================
 
-@app.get("/health")
+@app.get("/", tags=["system"])
+async def root():
+    """Корневой эндпоинт с информацией об API"""
+    return {
+        "message": "Image Processing API", 
+        "version": "2.0.0", 
+        "auth_required": True,
+        "docs_url": "/docs"
+    }
+
+@app.get("/health", tags=["system"])
 async def health_check():
+    """Проверка здоровья сервиса"""
     return {"status": "healthy"}
 
+# ==================== AUTH ENDPOINTS ====================
+
+@app.get("/auth/test", tags=["auth"])
+async def test_auth(user: dict = Depends(verify_api_key)):
+    """Тестирование аутентификации и проверка прав пользователя"""
+    return {
+        "authenticated": True,
+        "username": user.get("username"),
+        "is_admin": user.get("is_admin", False)
+    }
+
+# ==================== PROCESSING ENDPOINTS ====================
+'''
 @app.post(
-    "/process-single",
-    response_model=ImageResponse
+    "/processing/single",
+    response_model=ImageResponse,
+    tags=["processing"]
 )
 async def process_single_image(
     white_bg: bool = True,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    user: dict = Depends(verify_api_key)
 ):
-    """Обрабатывает одно изображение и возвращает его напрямую"""
+    """Обработка одного изображения с возвратом результата напрямую"""
     if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
         raise HTTPException(400, "Invalid image format")
     
@@ -65,14 +92,16 @@ async def process_single_image(
         raise HTTPException(500, f"Processing failed: {str(e)}")
 
 @app.post(
-    "/process-batch",
-    response_class=Response
+    "/processing/batch",
+    response_class=Response,
+    tags=["processing"]
 )
 async def process_batch(
     white_bg: bool = True,
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    user: dict = Depends(verify_api_key)
 ):
-    """Обрабатывает несколько изображений и возвращает ZIP архив"""
+    """Пакетная обработка нескольких изображений с возвратом ZIP архива"""
     if not files:
         raise HTTPException(400, "No files provided")
     
@@ -94,15 +123,18 @@ async def process_batch(
         
     except Exception as e:
         raise HTTPException(500, f"Processing failed: {str(e)}")
-
-@app.post("/process-parallel", response_model=ProcessingResponse)
+'''
+@app.post("/processing/parallel", 
+          response_model=ProcessingResponse,
+          tags=["processing"])
 async def process_parallel(
     background_tasks: BackgroundTasks,
     white_bg: bool = True,
-    files: List[UploadFile] = File(...)
+    files: List[UploadFile] = File(...),
+    user: dict = Depends(verify_api_key)
 ):
     """
-    Запускает параллельную обработку и возвращает ID задачи
+    Запуск параллельной обработки с возвратом идентификатора задачи
     """
     if not files:
         raise HTTPException(400, "No files provided")
@@ -120,9 +152,16 @@ async def process_parallel(
         task_id=task_id
     )
 
-@app.get("/tasks/{task_id}/status", response_model=TaskStatusResponse)
-async def get_task_status(task_id: str):
-    """Возвращает статус задачи"""
+# ==================== TASKS ENDPOINTS ====================
+
+@app.get("/tasks/{task_id}/status", 
+         response_model=TaskStatusResponse,
+         tags=["tasks"])
+async def get_task_status(
+    task_id: str,
+    user: dict = Depends(verify_api_key)
+):
+    """Получение статуса и прогресса выполнения задачи"""
     task = task_manager.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -138,9 +177,13 @@ async def get_task_status(task_id: str):
         error=task["error"]
     )
 
-@app.get("/tasks/{task_id}/download")
-async def download_task_result(task_id: str):
-    """Скачивает результат выполненной задачи"""
+@app.get("/tasks/{task_id}/download",
+         tags=["tasks"])
+async def download_task_result(
+    task_id: str,
+    user: dict = Depends(verify_api_key)
+):
+    """Скачивание результатов выполненной задачи"""
     task = task_manager.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
@@ -162,17 +205,163 @@ async def download_task_result(task_id: str):
         }
     )
 
-@app.delete("/tasks/{task_id}")
-async def delete_task(task_id: str):
-    """Удаляет задачу и освобождает память"""
-    task = task_manager.get_task(task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    
-    # В реальной системе здесь нужно аккуратно удалить задачу из словаря
-    # Для простоты просто возвращаем успех
-    return {"success": True, "message": "Task deletion scheduled"}
+# ==================== ADMIN ENDPOINTS ====================
+
+@app.post("/admin/users", 
+          response_model=APIKeyResponse,
+          tags=["admin", "users"])
+async def create_user(
+    user_data: UserCreate,
+    admin: dict = Depends(verify_admin)
+):
+    """Создание нового пользователя системы"""
+    try:
+        api_key = auth_manager.create_user(
+            username=user_data.username,
+            is_admin=user_data.is_admin,
+            rate_limit=user_data.rate_limit
+        )
+        
+        return APIKeyResponse(
+            username=user_data.username,
+            api_key=api_key,
+            message="User created successfully"
+        )
+        
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to create user: {str(e)}")
+
+@app.get("/admin/users", 
+         response_model=List[UserResponse],
+         tags=["admin", "users"])
+async def list_users(admin: dict = Depends(verify_admin)):
+    """Получение списка всех пользователей системы"""
+    try:
+        users = auth_manager.get_users(admin)
+        return users
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get users: {str(e)}")
+
+@app.put("/admin/users/{username}",
+         tags=["admin", "users"])
+async def update_user(
+    username: str,
+    updates: UserUpdate,
+    admin: dict = Depends(verify_admin)
+):
+    """Обновление данных пользователя"""
+    try:
+        success = auth_manager.update_user(username, updates.dict(exclude_unset=True), admin)
+        if not success:
+            raise HTTPException(404, f"User {username} not found")
+        
+        return {"message": f"User {username} updated successfully"}
+        
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to update user: {str(e)}")
+
+@app.delete("/admin/users/{username}",
+            tags=["admin", "users"])
+async def delete_user(
+    username: str,
+    admin: dict = Depends(verify_admin)
+):
+    """Удаление пользователя из системы"""
+    try:
+        success = auth_manager.delete_user(username, admin)
+        if not success:
+            raise HTTPException(404, f"User {username} not found")
+        
+        return {"message": f"User {username} deleted successfully"}
+        
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete user: {str(e)}")
+
+# ==================== TOKENS ENDPOINTS ====================
+
+@app.post("/admin/tokens/{username}/regenerate",
+          tags=["admin", "tokens"])
+async def regenerate_api_key(
+    username: str,
+    admin: dict = Depends(verify_admin)
+):
+    """Перегенерация API ключа для пользователя"""
+    try:
+        new_api_key = auth_manager.regenerate_api_key(username, admin)
+        
+        return {
+            "username": username,
+            "new_api_key": new_api_key,
+            "message": "API key regenerated successfully"
+        }
+        
+    except (PermissionError, ValueError) as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Failed to regenerate API key: {str(e)}")
+
+# ==================== STATISTICS ENDPOINTS ====================
+
+@app.get("/admin/statistics",
+         tags=["admin", "statistics"])
+async def get_stats(admin: dict = Depends(verify_admin)):
+    """Получение статистики использования API"""
+    try:
+        stats = {
+            "total_tasks": len(task_manager._tasks),
+            "active_tasks": sum(1 for task in task_manager._tasks.values() 
+                              if task.get("status") == TaskStatus.PROCESSING),
+            "completed_tasks": sum(1 for task in task_manager._tasks.values() 
+                                 if task.get("status") == TaskStatus.COMPLETED),
+            "failed_tasks": sum(1 for task in task_manager._tasks.values() 
+                              if task.get("status") == TaskStatus.FAILED),
+            "total_users": len(auth_manager.get_users(admin)),
+            "active_users": len([u for u in auth_manager.get_users(admin) 
+                               if u.get("is_active", True)]),
+            "admin_users": len([u for u in auth_manager.get_users(admin) 
+                              if u.get("is_admin", False)])
+        }
+        return stats
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get stats: {str(e)}")
+
+@app.get("/admin/statistics/tasks",
+         tags=["admin", "statistics"])
+async def get_tasks_statistics(admin: dict = Depends(verify_admin)):
+    """Детальная статистика по задачам"""
+    try:
+        tasks = task_manager._tasks
+        recent_tasks = sorted(
+            [task for task in tasks.values() if task.get("start_time")],
+            key=lambda x: x["start_time"],
+            reverse=True
+        )[:10]  # Последние 10 задач
+        
+        return {
+            "recent_tasks": [
+                {
+                    "task_id": task_id,
+                    "status": task.get("status"),
+                    "progress": task.get("progress", 0),
+                    "processed_files": task.get("processed_files", 0),
+                    "total_files": task.get("total_files", 0),
+                    "start_time": task.get("start_time"),
+                    "end_time": task.get("end_time")
+                }
+                for task_id, task in list(tasks.items())[-10:]  # Последние 10 по времени создания
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Failed to get tasks statistics: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
